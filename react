@@ -1,0 +1,272 @@
+# ============================================================
+# 📱 データ収集アプリ（Python + Kivy）
+# sensor_collector.py
+# ============================================================
+
+"""
+このコードはPC/Androidで動作するデータ収集アプリの例です。
+実際のスマホアプリ開発では、React Native/Flutter/Swift/Kotlinを
+使うことをおすすめします。
+"""
+
+import cv2
+import numpy as np
+import pandas as pd
+import json
+import time
+from datetime import datetime
+from collections import deque
+
+class SensorDataCollector:
+    """センサーデータ収集クラス"""
+    
+    def __init__(self, window_size=30):
+        self.window_size = window_size
+        self.data_buffer = []
+        self.sequence_id = 0
+        self.current_label = 0  # 0=直進, 1=右折, 2=左折
+        
+        # カメラ
+        self.cap = None
+        self.prev_frame = None
+        
+        # オプティカルフロー用パラメータ
+        self.lk_params = dict(
+            winSize=(15, 15),
+            maxLevel=2,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03)
+        )
+        
+        # 特徴点検出用パラメータ
+        self.feature_params = dict(
+            maxCorners=100,
+            qualityLevel=0.3,
+            minDistance=7,
+            blockSize=7
+        )
+    
+    def calculate_optical_flow(self, frame):
+        """オプティカルフローを計算"""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        if self.prev_frame is None:
+            self.prev_frame = gray
+            self.prev_points = cv2.goodFeaturesToTrack(gray, mask=None, **self.feature_params)
+            return 0, 0, 0, 0
+        
+        if self.prev_points is None or len(self.prev_points) < 10:
+            self.prev_points = cv2.goodFeaturesToTrack(gray, mask=None, **self.feature_params)
+            if self.prev_points is None:
+                self.prev_frame = gray
+                return 0, 0, 0, 0
+        
+        # オプティカルフロー計算
+        next_points, status, error = cv2.calcOpticalFlowPyrLK(
+            self.prev_frame, gray, self.prev_points, None, **self.lk_params
+        )
+        
+        if next_points is None:
+            self.prev_frame = gray
+            self.prev_points = cv2.goodFeaturesToTrack(gray, mask=None, **self.feature_params)
+            return 0, 0, 0, 0
+        
+        # 有効な点のみ使用
+        good_old = self.prev_points[status == 1]
+        good_new = next_points[status == 1]
+        
+        if len(good_new) < 5:
+            self.prev_frame = gray
+            self.prev_points = cv2.goodFeaturesToTrack(gray, mask=None, **self.feature_params)
+            return 0, 0, 0, 0
+        
+        # フローベクトルの計算
+        flow = good_new - good_old
+        flow_x = np.mean(flow[:, 0])
+        flow_y = np.mean(flow[:, 1])
+        flow_magnitude = np.mean(np.sqrt(flow[:, 0]**2 + flow[:, 1]**2))
+        flow_angle = np.arctan2(np.mean(flow[:, 1]), np.mean(flow[:, 0]))
+        
+        self.prev_frame = gray
+        self.prev_points = good_new.reshape(-1, 1, 2)
+        
+        return flow_x, flow_y, flow_magnitude, flow_angle
+    
+    def detect_vanishing_point(self, frame):
+        """消失点を検出（簡易版）"""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 50, 150)
+        
+        # ハフ変換で直線検出
+        lines = cv2.HoughLinesP(edges, 1, np.pi/180, 50, minLineLength=50, maxLineGap=10)
+        
+        if lines is None or len(lines) < 2:
+            return 0.5, 0.4  # デフォルト（画面中央上部）
+        
+        # 直線の交点から消失点を推定（簡易版）
+        intersections = []
+        h, w = frame.shape[:2]
+        
+        for i in range(min(len(lines), 10)):
+            for j in range(i + 1, min(len(lines), 10)):
+                line1 = lines[i][0]
+                line2 = lines[j][0]
+                
+                # 交点計算
+                x1, y1, x2, y2 = line1
+                x3, y3, x4, y4 = line2
+                
+                denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+                if abs(denom) < 1e-6:
+                    continue
+                
+                t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
+                
+                ix = x1 + t * (x2 - x1)
+                iy = y1 + t * (y2 - y1)
+                
+                # 画面内の妥当な範囲
+                if 0 <= ix <= w and 0 <= iy <= h * 0.7:
+                    intersections.append((ix / w, iy / h))
+        
+        if len(intersections) == 0:
+            return 0.5, 0.4
+        
+        # 中央値を使用
+        vp_x = np.median([p[0] for p in intersections])
+        vp_y = np.median([p[1] for p in intersections])
+        
+        return vp_x, vp_y
+    
+    def simulate_imu_data(self):
+        """
+        IMUデータのシミュレーション
+        実際のアプリでは、デバイスのセンサーAPIから取得
+        """
+        # 実際の実装では:
+        # - Android: SensorManager
+        # - iOS: CoreMotion
+        # - React Native: react-native-sensors
+        return {
+            'gyro_x': np.random.normal(0, 0.02),
+            'gyro_y': np.random.normal(0, 0.02),
+            'gyro_z': np.random.normal(0, 0.05),
+            'accel_x': np.random.normal(0, 0.1),
+            'accel_y': np.random.normal(0, 0.1),
+            'accel_z': np.random.normal(9.8, 0.2)
+        }
+    
+    def collect_frame(self, frame, imu_data=None):
+        """1フレーム分のデータを収集"""
+        timestamp = time.time()
+        
+        # IMUデータ（実機では実際のセンサー値を使用）
+        if imu_data is None:
+            imu_data = self.simulate_imu_data()
+        
+        # カメラからの特徴量
+        flow_x, flow_y, flow_mag, flow_angle = self.calculate_optical_flow(frame)
+        vp_x, vp_y = self.detect_vanishing_point(frame)
+        
+        data_point = {
+            'timestamp': timestamp,
+            'sequence_id': self.sequence_id,
+            'label': self.current_label,
+            'gyro_x': imu_data['gyro_x'],
+            'gyro_y': imu_data['gyro_y'],
+            'gyro_z': imu_data['gyro_z'],
+            'accel_x': imu_data['accel_x'],
+            'accel_y': imu_data['accel_y'],
+            'accel_z': imu_data['accel_z'],
+            'flow_x': flow_x,
+            'flow_y': flow_y,
+            'flow_magnitude': flow_mag,
+            'flow_angle': flow_angle,
+            'vanishing_point_x': vp_x,
+            'vanishing_point_y': vp_y
+        }
+        
+        self.data_buffer.append(data_point)
+        return data_point
+    
+    def set_label(self, label):
+        """ラベルを設定（0=直進, 1=右折, 2=左折）"""
+        if self.current_label != label:
+            self.sequence_id += 1
+        self.current_label = label
+    
+    def save_data(self, filename='sensor_data.csv'):
+        """データをCSVに保存"""
+        df = pd.DataFrame(self.data_buffer)
+        df.to_csv(filename, index=False)
+        print(f"✅ データ保存: {filename} ({len(df)} レコード)")
+        return df
+
+
+def run_collection_demo():
+    """データ収集デモ（Webカメラ使用）"""
+    collector = SensorDataCollector()
+    
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("❌ カメラを開けません")
+        return
+    
+    print("=" * 50)
+    print("📷 データ収集モード")
+    print("キー操作:")
+    print("  0: 直進としてラベル付け")
+    print("  1: 右折としてラベル付け")
+    print("  2: 左折としてラベル付け")
+    print("  s: データ保存")
+    print("  q: 終了")
+    print("=" * 50)
+    
+    label_names = ['直進', '右折', '左折']
+    frame_count = 0
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        # データ収集
+        data_point = collector.collect_frame(frame)
+        frame_count += 1
+        
+        # 情報表示
+        info_frame = frame.copy()
+        cv2.putText(info_frame, f"Label: {label_names[collector.current_label]}", 
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        cv2.putText(info_frame, f"Seq: {collector.sequence_id}, Frame: {frame_count}", 
+                    (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(info_frame, f"Flow: ({data_point['flow_x']:.2f}, {data_point['flow_y']:.2f})", 
+                    (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(info_frame, f"VP: ({data_point['vanishing_point_x']:.2f}, {data_point['vanishing_point_y']:.2f})", 
+                    (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        
+        cv2.imshow('Data Collection', info_frame)
+        
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('0'):
+            collector.set_label(0)
+            print("📍 ラベル: 直進")
+        elif key == ord('1'):
+            collector.set_label(1)
+            print("📍 ラベル: 右折")
+        elif key == ord('2'):
+            collector.set_label(2)
+            print("📍 ラベル: 左折")
+        elif key == ord('s'):
+            collector.save_data()
+        elif key == ord('q'):
+            break
+    
+    cap.release()
+    cv2.destroyAllWindows()
+    
+    # 終了時に保存
+    collector.save_data()
+
+
+if __name__ == '__main__':
+    run_collection_demo()
